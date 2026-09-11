@@ -1,0 +1,8 @@
+{
+  "name": "Remix nikilow",
+  "description": "a personal, melancholic, and thoughtful ai companion with real-time chat, session history, and dark/light themes",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
