@@ -829,55 +829,90 @@ export async function resendVerificationEmail(email: string) {
  */
 export async function fetchFeedPosts(currentUserId?: string): Promise<Post[]> {
   const userLikes = getStoredUserLikes();
+  let dbPostsList: Post[] = [];
 
+  // 1. Try fetching from /api/posts endpoint (reliable serverless function)
   try {
-    const { data: dbPosts, error } = await supabase
-      .from('posts')
-      .select('*')
-      .order('created_at', { ascending: false });
-
-    if (!error && dbPosts && dbPosts.length > 0) {
-      // Map DB posts to Post interface
-      const mapped: Post[] = dbPosts.map((p) => {
-        const isKodewt = p.author_username?.toLowerCase() === 'kodewt';
-        return {
-          id: p.id,
-          userId: p.user_id,
-          authorName: p.author_name || p.author_username,
-          authorUsername: p.author_username,
-          authorAvatar: p.author_avatar || '',
-          content: p.content,
-          createdAt: new Date(p.created_at).getTime(),
-          likesCount: p.likes_count || 0,
+    const res = await fetch('/api/posts');
+    if (res.ok) {
+      const data = await res.json();
+      if (Array.isArray(data?.posts)) {
+        dbPostsList = data.posts.map((p: any) => ({
+          ...p,
           isLiked: userLikes.includes(p.id),
-          isVerified: isKodewt || p.is_verified,
-        };
-      });
-
-      return mapped.sort((a, b) => b.createdAt - a.createdAt);
+          isVerified: p.isVerified || p.authorUsername?.toLowerCase() === 'kodewt',
+        }));
+      }
     }
-  } catch (err) {
-    console.warn('fetchFeedPosts fallback to local storage:', err);
+  } catch (apiErr) {
+    console.warn('fetchFeedPosts API fallback to direct client:', apiErr);
   }
 
-  // Fallback to local storage (only user's published posts)
+  // 2. Fallback to direct client if API returned empty / failed
+  if (dbPostsList.length === 0) {
+    try {
+      const { data: dbPosts, error } = await supabase
+        .from('posts')
+        .select('*')
+        .order('created_at', { ascending: false });
+
+      if (!error && dbPosts && dbPosts.length > 0) {
+        dbPostsList = dbPosts.map((p) => {
+          const isKodewt = p.author_username?.toLowerCase() === 'kodewt';
+          return {
+            id: p.id,
+            userId: p.user_id,
+            authorName: p.author_name || p.author_username,
+            authorUsername: p.author_username,
+            authorAvatar: p.author_avatar || '',
+            content: p.content,
+            createdAt: new Date(p.created_at).getTime(),
+            likesCount: p.likes_count || 0,
+            isLiked: userLikes.includes(p.id),
+            isVerified: isKodewt || p.is_verified,
+          };
+        });
+      }
+    } catch (err) {
+      console.warn('fetchFeedPosts client query notice:', err);
+    }
+  }
+
+  // 3. Merge with local posts cache so user's recent posts are NEVER lost
   const localPosts = getStoredLocalPosts();
-  return localPosts.map((p) => ({
-    ...p,
-    isLiked: userLikes.includes(p.id),
-    isVerified: p.authorUsername.toLowerCase() === 'kodewt',
-  }));
+  const combinedMap = new Map<string, Post>();
+
+  // Add DB posts first
+  for (const p of dbPostsList) {
+    combinedMap.set(p.id, p);
+  }
+
+  // Add any local posts that aren't yet in DB (or authored recently)
+  for (const lp of localPosts) {
+    if (!combinedMap.has(lp.id)) {
+      combinedMap.set(lp.id, {
+        ...lp,
+        isLiked: userLikes.includes(lp.id),
+        isVerified: lp.authorUsername.toLowerCase() === 'kodewt' || lp.isVerified,
+      });
+    }
+  }
+
+  return Array.from(combinedMap.values()).sort((a, b) => b.createdAt - a.createdAt);
 }
 
 /**
  * Create a new post (max 300 chars)
  */
 export async function createFeedPost(
-  arg1: string | { content: string; userProfile: UserProfile },
-  arg2?: UserProfile
+  arg1: string | { content: string; userProfile: UserProfile; skipRateLimitCheck?: boolean },
+  arg2?: UserProfile,
+  skipRateLimitCheck: boolean = false
 ): Promise<Post> {
   const content = typeof arg1 === 'string' ? arg1 : arg1.content;
   const userProfile = typeof arg1 === 'string' ? arg2! : arg1.userProfile;
+  const shouldSkipRateLimit =
+    skipRateLimitCheck || (typeof arg1 === 'object' && Boolean(arg1.skipRateLimitCheck));
 
   const trimmed = (content || '').trim();
   if (!trimmed) {
@@ -887,17 +922,17 @@ export async function createFeedPost(
     throw new Error('Post cannot exceed 300 characters');
   }
 
-  // Enforce 5-minute rate limit for posting updates
-  const rateLimit = getPostRateLimitStatus(userProfile.id);
-  if (rateLimit.isRateLimited) {
-    throw new Error(
-      `Rate limit active: you can only post updates once every 5 minutes (wait ${rateLimit.formattedRemaining}).`
-    );
+  // Enforce 5-minute rate limit for posting updates if not already verified by caller
+  if (!shouldSkipRateLimit) {
+    const rateLimit = getPostRateLimitStatus(userProfile.id);
+    if (rateLimit.isRateLimited) {
+      throw new Error(
+        `Rate limit active: you can only post updates once every 5 minutes (wait ${rateLimit.formattedRemaining}).`
+      );
+    }
   }
 
   const postTime = Date.now();
-  recordPostTimestamp(userProfile.id, postTime);
-
   const isKodewt = userProfile.username.toLowerCase() === 'kodewt';
   const newPost: Post = {
     id: 'post_' + postTime + '_' + Math.random().toString(36).substring(2, 6),
@@ -909,35 +944,69 @@ export async function createFeedPost(
     createdAt: postTime,
     likesCount: 0,
     isLiked: false,
-    isVerified: isKodewt,
+    isVerified: isKodewt || Boolean(userProfile.is_verified),
   };
 
-  // Try saving to Supabase if connected
+  // 1. Try saving to server API endpoint (bypasses RLS issues via service role)
+  let savedToBackend = false;
   try {
-    const { data, error } = await supabase
-      .from('posts')
-      .insert({
-        user_id: userProfile.id,
-        author_name: newPost.authorName,
-        author_username: newPost.authorUsername,
-        author_avatar: newPost.authorAvatar,
-        content: newPost.content,
-        likes_count: 0,
-        is_verified: isKodewt,
-      })
-      .select()
-      .single();
+    const res = await fetch('/api/posts/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        content: trimmed,
+        userId: userProfile.id,
+        authorName: newPost.authorName,
+        authorUsername: newPost.authorUsername,
+        authorAvatar: newPost.authorAvatar,
+        isVerified: newPost.isVerified,
+      }),
+    });
 
-    if (!error && data) {
-      newPost.id = data.id;
+    if (res.ok) {
+      const data = await res.json();
+      if (data?.post?.id) {
+        newPost.id = data.post.id;
+        newPost.createdAt = data.post.createdAt || postTime;
+        savedToBackend = true;
+      }
     }
-  } catch (err) {
-    console.warn('createFeedPost saved to local cache:', err);
+  } catch (apiErr) {
+    console.warn('createFeedPost API call notice, attempting client fallback:', apiErr);
   }
+
+  // 2. Fallback to direct client insert if API did not save
+  if (!savedToBackend) {
+    try {
+      const { data, error } = await supabase
+        .from('posts')
+        .insert({
+          user_id: userProfile.id,
+          author_name: newPost.authorName,
+          author_username: newPost.authorUsername,
+          author_avatar: newPost.authorAvatar,
+          content: newPost.content,
+          likes_count: 0,
+          is_verified: newPost.isVerified,
+        })
+        .select()
+        .single();
+
+      if (!error && data) {
+        newPost.id = data.id;
+        savedToBackend = true;
+      }
+    } catch (err) {
+      console.warn('createFeedPost saved to local cache:', err);
+    }
+  }
+
+  // Record rate limit timestamp only now that the post was initiated
+  recordPostTimestamp(userProfile.id, postTime);
 
   // Always update local cache
   const localPosts = getStoredLocalPosts();
-  saveStoredLocalPosts([newPost, ...localPosts]);
+  saveStoredLocalPosts([newPost, ...localPosts.filter((p) => p.id !== newPost.id)]);
 
   return newPost;
 }
@@ -1007,7 +1076,18 @@ export async function deleteFeedPost(postId: string, userId?: string): Promise<b
   const filtered = localPosts.filter((p) => p.id !== postId);
   saveStoredLocalPosts(filtered);
 
-  // 2. Remove from Supabase if connected
+  // 2. Remove via server API (service role)
+  try {
+    await fetch('/api/posts/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ postId, userId }),
+    });
+  } catch (err) {
+    console.warn('deleteFeedPost API call notice:', err);
+  }
+
+  // 3. Remove from Supabase client if connected
   try {
     let query = supabase.from('posts').delete().eq('id', postId);
     if (userId) {

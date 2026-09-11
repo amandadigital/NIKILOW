@@ -458,8 +458,6 @@ export default function App() {
     }
 
     const now = Date.now();
-    recordPostTimestamp(userProfile.id, now);
-
     const tempId = 'post_' + now + '_' + Math.random().toString(36).substring(2, 6);
     const isKodewt = userProfile.username.toLowerCase() === 'kodewt';
     const optimisticPost: Post = {
@@ -472,7 +470,7 @@ export default function App() {
       createdAt: now,
       likesCount: 0,
       isLiked: false,
-      isVerified: isKodewt || userProfile.is_verified,
+      isVerified: isKodewt || Boolean(userProfile.is_verified),
     };
 
     // 1. Instant visual display
@@ -480,14 +478,21 @@ export default function App() {
 
     // 2. Background database persistence
     try {
-      const savedPost = await createFeedPost(trimmed, userProfile);
-      if (savedPost && savedPost.id !== tempId) {
+      const savedPost = await createFeedPost(
+        { content: trimmed, userProfile, skipRateLimitCheck: true },
+        undefined,
+        true
+      );
+      if (savedPost) {
         setPosts((prev) =>
           prev.map((p) => (p.id === tempId ? { ...savedPost, isLiked: false } : p))
         );
       }
     } catch (err) {
-      console.warn('Failed to sync post to database:', err);
+      // Revert optimistic post on failure
+      setPosts((prev) => prev.filter((p) => p.id !== tempId));
+      console.error('Failed to sync post to database:', err);
+      throw err;
     }
   };
 
