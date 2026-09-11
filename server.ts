@@ -155,7 +155,7 @@ const CANDIDATE_MODELS = [
   "gemini-flash-latest",
 ];
 
-cconst getGeminiClient = () => {
+const getGeminiClient = () => {
   const apiKey = process.env.GEMINI_API_KEY;
 
   if (!apiKey) {
