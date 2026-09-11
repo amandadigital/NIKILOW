@@ -1,9 +1,10 @@
+// api/_lib/gemini.ts
 import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
 
 dotenv.config();
 
-// List of fallback models in priority order (gemini-3.8-flash first as per gemini-api guidelines)
+// List of fallback models in priority order
 export const CANDIDATE_MODELS = [
   "gemini-3.8-flash",
   "gemini-3.1-flash-lite",
@@ -11,9 +12,14 @@ export const CANDIDATE_MODELS = [
 ];
 
 export const getGeminiClient = () => {
-  const apiKey =
-    process.env.GEMINI_API_KEY ||
-    "REMOVED_SECRET";
+  const apiKey = process.env.GEMINI_API_KEY;
+
+  if (!apiKey) {
+    throw new Error(
+      "GEMINI_API_KEY is not set. Add it to your environment variables " +
+        "(.env locally, Vercel Project Settings → Environment Variables in prod)."
+    );
+  }
 
   return new GoogleGenAI({
     apiKey,
@@ -30,16 +36,18 @@ export function getSystemInstruction(
   crossChatContext?: string,
   customPersonality?: { name?: string; prompt?: string }
 ) {
-  const companionName = (customPersonality?.name || '').trim() || 'Nikilow';
-  const customPrompt = (customPersonality?.prompt || '').trim();
+  const companionName = (customPersonality?.name || "").trim() || "Nikilow";
+  const customPrompt = (customPersonality?.prompt || "").trim();
 
   const isKodewt =
-    userProfile?.username?.toLowerCase() === 'kodewt' ||
-    userProfile?.username?.toLowerCase() === '@kodewt' ||
-    userProfile?.name?.toLowerCase().includes('kodewt');
+    userProfile?.username?.toLowerCase() === "kodewt" ||
+    userProfile?.username?.toLowerCase() === "@kodewt" ||
+    userProfile?.name?.toLowerCase().includes("kodewt");
 
   const userDisplayName =
-    userProfile?.name || userProfile?.username || (isKodewt ? 'kodewt' : 'friend');
+    userProfile?.name ||
+    userProfile?.username ||
+    (isKodewt ? "kodewt" : "friend");
 
   const kodewtRelationship = isKodewt
     ? `RELATIONSHIP:
@@ -57,7 +65,7 @@ export function getSystemInstruction(
     ? `\n\nCROSS-CHAT MEMORY (YOU REMEMBER EVERYTHING ACROSS CHATS):
 You have continuous memory across all your conversations with this user. You recall past discussions, their interests, personal details, and things you talked about in other chats. Reference them naturally when relevant:
 ${crossChatContext}`
-    : '';
+    : "";
 
   if (customPrompt) {
     return `You are ${companionName}.
